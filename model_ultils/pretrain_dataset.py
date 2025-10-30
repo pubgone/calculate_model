@@ -35,7 +35,7 @@ class PretrainDataset(Dataset):
         )
 
         input_ids = encoding.input_ids.squeeze()  # [max_length]
-        loss_mask = (input_ids != self.tokenizer.pad_id)  # 注意：用 .pad_id
+        loss_mask = (input_ids != self.tokenizer.pad_token_id)  # 注意：用 .pad_id
 
         # 构造自回归任务
         X = input_ids[:-1].clone().detach().long()

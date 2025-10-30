@@ -82,17 +82,30 @@ def train_epoch(epoch, wandb):
 
         if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
             model.eval()
-            moe_path = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
+            ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}")
+            os.makedirs(ckp_dir, exist_ok=True)
 
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
+            actual_model = model.module if isinstance(model, DistributedDataParallel) else model
 
-            state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
-            torch.save(state_dict, ckp)
-            model.train()
+            # 只保存模型（config + weights）
+            actual_model.save_pretrained(ckp_dir, safe_serialization=False)
+            # 不再保存 tokenizer！
+
+            Logger(f"Model checkpoint has been saved to: {ckp_dir}")
+            model.train()    
+        # if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
+        #     model.eval()
+        #     moe_path = '_moe' if lm_config.use_moe else ''
+        #     ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
+
+        #     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        #         state_dict = model.module.state_dict()
+        #     else:
+        #         state_dict = model.state_dict()
+
+        #     state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
+        #     torch.save(state_dict, ckp)
+        #     model.train()
 
 
 def init_model(lm_config):
@@ -182,6 +195,10 @@ if __name__ == "__main__":
         wandb = None
 
     model, tokenizer = init_model(lm_config)
+    if not ddp or dist.get_rank() == 0:
+        tokenizer_save_path = os.path.join(args.save_dir, "tokenizer")
+        tokenizer.save_pretrained(tokenizer_save_path)
+    Logger(f"Tokenizer has been saved to: {tokenizer_save_path}")
     # # 🔍 === 验证代码放在这里 ===
     # if not ddp or dist.get_rank() == 0:  # 只在主进程打印，避免多卡重复输出
     #     print("✅ Tokenizer vocab size:", tokenizer.vocab_size)
@@ -192,6 +209,7 @@ if __name__ == "__main__":
     #     print("✅ Test encode IDs:", test_encode.tolist())       # 转为 list 打印
     #     print("✅ Decoded back:", tokenizer.decode(test_encode[0], skip_special_tokens=False))
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(
         train_ds,
@@ -214,3 +232,21 @@ if __name__ == "__main__":
     for epoch in range(args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         train_epoch(epoch, wandb)
+    # 训练循环结束后
+    if not ddp or (ddp and dist.get_rank() == 0):
+        # 构建最终模型名称
+        model_name = f"minimind-math-h{args.hidden_size}-l{args.num_hidden_layers}"
+        if args.use_moe:
+            model_name += "-moe"
+
+        final_model_path = os.path.join(args.save_dir, model_name)
+        os.makedirs(final_model_path, exist_ok=True)
+
+        actual_model = model.module if isinstance(model, DistributedDataParallel) else model
+
+        # 保存完整模型（权重 + config）
+        actual_model.save_pretrained(final_model_path, safe_serialization=False)
+        # 保存 tokenizer（这次要包含！）
+        tokenizer.save_pretrained(final_model_path)
+
+        Logger(f"The final model has been saved to: {final_model_path}")

@@ -46,12 +46,15 @@ class HFMathTokenizer(PreTrainedTokenizer):
         self.vocab = vocab_clean
         self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}
-
-        # 特殊 token
-        pad_token = "<pad>"
-        unk_token = "<unk>"
-        bos_token = "<s>"
-        eos_token = "</s>"
+        bos_token = kwargs.pop("bos_token", "<s>")
+        eos_token = kwargs.pop("eos_token", "</s>")
+        unk_token = kwargs.pop("unk_token", "<unk>")
+        pad_token = kwargs.pop("pad_token", "<pad>")
+        # # 特殊 token
+        # pad_token = "<pad>"
+        # unk_token = "<unk>"
+        # bos_token = "<s>"
+        # eos_token = "</s>"
 
         # 调用父类初始化
         super().__init__(
