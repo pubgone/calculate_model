@@ -79,20 +79,30 @@ def train_epoch(epoch, wandb):
                 wandb.log({"loss": loss.item() * args.accumulation_steps,
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
-
         if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
             model.eval()
-            ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}")
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}-{timestamp}")
             os.makedirs(ckp_dir, exist_ok=True)
 
             actual_model = model.module if isinstance(model, DistributedDataParallel) else model
-
-            # 只保存模型（config + weights）
             actual_model.save_pretrained(ckp_dir, safe_serialization=False)
-            # 不再保存 tokenizer！
-
             Logger(f"Model checkpoint has been saved to: {ckp_dir}")
-            model.train()    
+            model.train()
+        # if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
+        #     model.eval()
+        #     ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}")
+        #     os.makedirs(ckp_dir, exist_ok=True)
+
+        #     actual_model = model.module if isinstance(model, DistributedDataParallel) else model
+
+        #     # 只保存模型（config + weights）
+        #     actual_model.save_pretrained(ckp_dir, safe_serialization=False)
+        #     # 不再保存 tokenizer！
+
+        #     Logger(f"Model checkpoint has been saved to: {ckp_dir}")
+        #     model.train()    
+
         # if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
         #     model.eval()
         #     moe_path = '_moe' if lm_config.use_moe else ''
@@ -108,10 +118,16 @@ def train_epoch(epoch, wandb):
         #     model.train()
 
 
-def init_model(lm_config):
+def init_model(lm_config, resume_path=None):
     tokenizer = HFMathTokenizer()
     lm_config.vocab_size = tokenizer.vocab_size  # ← 新增这一行
-    model = MiniMindForCausalLM(lm_config).to(args.device)
+    if resume_path is not None and os.path.exists(resume_path):
+        Logger(f"Loading model from checkpoint: {resume_path}")
+        model = MiniMindForCausalLM.from_pretrained(resume_path, config=lm_config)
+    else:
+        model = MiniMindForCausalLM(lm_config)
+
+    model = model.to(args.device)
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model, tokenizer
 
@@ -154,10 +170,21 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=512, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="corpus/random/addition/1_digit_additions.txt")
+    parser.add_argument("--resume_from", type=str, default=None,
+                    help="Path to a checkpoint directory to resume training from (e.g., ../out/checkpoint-epoch1-step1000)")
     args = parser.parse_args()
-
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=args.use_moe)
+    lm_config = MiniMindConfig(
+        hidden_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        max_position_embeddings=512,
+        rope_theta=10000.0,
+        use_moe=False,
+        dropout=0.1,
+        flash_attn=True
+    )
+    # lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
+    #                            use_moe=args.use_moe)
     args.save_dir = os.path.join(args.out_dir)
     # model, tokenizer = init_model(lm_config)
     # print("✅ Tokenizer vocab size:", tokenizer.vocab_size)
@@ -194,7 +221,7 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer = init_model(lm_config)
+    model, tokenizer = init_model(lm_config, resume_path=args.resume_from)
     if not ddp or dist.get_rank() == 0:
         tokenizer_save_path = os.path.join(args.save_dir, "tokenizer")
         tokenizer.save_pretrained(tokenizer_save_path)
@@ -234,19 +261,34 @@ if __name__ == "__main__":
         train_epoch(epoch, wandb)
     # 训练循环结束后
     if not ddp or (ddp and dist.get_rank() == 0):
-        # 构建最终模型名称
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
         model_name = f"minimind-math-h{args.hidden_size}-l{args.num_hidden_layers}"
         if args.use_moe:
             model_name += "-moe"
+        model_name += f"-{timestamp}"
 
         final_model_path = os.path.join(args.save_dir, model_name)
         os.makedirs(final_model_path, exist_ok=True)
 
         actual_model = model.module if isinstance(model, DistributedDataParallel) else model
-
-        # 保存完整模型（权重 + config）
         actual_model.save_pretrained(final_model_path, safe_serialization=False)
-        # 保存 tokenizer（这次要包含！）
         tokenizer.save_pretrained(final_model_path)
 
         Logger(f"The final model has been saved to: {final_model_path}")
+    # if not ddp or (ddp and dist.get_rank() == 0):
+    #     # 构建最终模型名称
+    #     model_name = f"minimind-math-h{args.hidden_size}-l{args.num_hidden_layers}"
+    #     if args.use_moe:
+    #         model_name += "-moe"
+
+    #     final_model_path = os.path.join(args.save_dir, model_name)
+    #     os.makedirs(final_model_path, exist_ok=True)
+
+    #     actual_model = model.module if isinstance(model, DistributedDataParallel) else model
+
+    #     # 保存完整模型（权重 + config）
+    #     actual_model.save_pretrained(final_model_path, safe_serialization=False)
+    #     # 保存 tokenizer（这次要包含！）
+    #     tokenizer.save_pretrained(final_model_path)
+
+    #     Logger(f"The final model has been saved to: {final_model_path}")
