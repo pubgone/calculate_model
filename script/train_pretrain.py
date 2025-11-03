@@ -3,7 +3,7 @@ import sys
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 在 import torch 之前设置！
 import argparse
 import time
 import math
@@ -14,6 +14,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
+from typing import Optional
 from my_tokenizers.hf_math_tokenizer import HFMathTokenizer
 from models.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from model_ultils.pretrain_dataset import PretrainDataset
@@ -30,15 +31,21 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
-def train_epoch(epoch, wandb):
+def train_epoch(epoch, wandb,start_step, iter_per_epoch):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
+
     for step, (X, Y, loss_mask) in enumerate(train_loader):
+        if step < start_step:
+            continue  # 跳过已训练的 steps
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
 
-        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
+        # ✅ 使用传入的 iter_per_epoch 计算全局 step
+        global_step = epoch * iter_per_epoch + step
+        total_steps = args.epochs * iter_per_epoch
+        lr = get_lr(global_step, total_steps, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -87,7 +94,20 @@ def train_epoch(epoch, wandb):
 
             actual_model = model.module if isinstance(model, DistributedDataParallel) else model
             actual_model.save_pretrained(ckp_dir, safe_serialization=False)
-            Logger(f"Model checkpoint has been saved to: {ckp_dir}")
+            # === 新增：保存训练状态 ===
+            checkpoint = {
+                'epoch': epoch,
+                'step': step + 1,
+                'model_state_dict': actual_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+                'lr': optimizer.param_groups[0]['lr'],
+                'args_dict': vars(args),            # 安全！
+                'lm_config_dict': lm_config.to_dict() if hasattr(lm_config, 'to_dict') else lm_config.__dict__,
+            }
+            torch.save(checkpoint, os.path.join(ckp_dir, 'trainer_state.pth'))
+
+            Logger(f"Full checkpoint saved to: {ckp_dir}")
             model.train()
         # if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
         #     model.eval()
@@ -131,6 +151,34 @@ def init_model(lm_config, resume_path=None):
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model, tokenizer
 
+def find_latest_checkpoint(save_dir: str) -> Optional[str]:
+    if not os.path.exists(save_dir):
+        return None
+    ckpt_dirs = [d for d in os.listdir(save_dir) if d.startswith("checkpoint-")]
+    if not ckpt_dirs:
+        return None
+    ckpt_paths = [os.path.join(save_dir, d) for d in ckpt_dirs]
+    return max(ckpt_paths, key=os.path.getctime)
+
+
+def resume_from_checkpoint(model, optimizer, scaler, checkpoint_path: str, device):
+    """从 checkpoint 恢复模型、优化器、scaler 状态，返回 (start_epoch, start_step)"""
+    ckpt_file = os.path.join(checkpoint_path, 'trainer_state.pth')
+    if not os.path.exists(ckpt_file):
+        raise FileNotFoundError(f"trainer_state.pth not found in {checkpoint_path}")
+    
+    Logger(f"Loading full checkpoint from: {checkpoint_path}")
+    checkpoint = torch.load(ckpt_file, map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scaler is not None and checkpoint.get('scaler_state_dict') is not None:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+    start_epoch = checkpoint['epoch']
+    start_step = checkpoint['step']
+    Logger(f"Resumed training from epoch {start_epoch}, step {start_step}")
+    return start_epoch, start_step
 
 def init_distributed_mode():
     if not ddp: return
@@ -250,15 +298,26 @@ if __name__ == "__main__":
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-
+    # ========== 在 DDP 之前恢复 checkpoint ==========
+    actual_model = model  # 保存原始模型引用
+    start_epoch, start_step_in_epoch = 0, 0
+    resume_checkpoint = args.resume_from or find_latest_checkpoint(args.save_dir)
+    if resume_checkpoint:
+        try:
+            start_epoch, start_step_in_epoch = resume_from_checkpoint(
+                actual_model, optimizer, scaler, resume_checkpoint, args.device
+            )
+        except Exception as e:
+            Logger(f"Resume failed: {e}. Starting from scratch.")
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        train_epoch(epoch, wandb)
+        current_start_step = start_step_in_epoch if epoch == start_epoch else 0
+        train_epoch(epoch, wandb, start_step_in_epoch if epoch == start_epoch else 0, iter_per_epoch)
     # 训练循环结束后
     if not ddp or (ddp and dist.get_rank() == 0):
         timestamp = time.strftime("%Y%m%d-%H%M%S")
