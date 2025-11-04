@@ -367,10 +367,38 @@ if __name__ == "__main__":
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
+    # ====== 🌟 新增：记录训练开始时间 ======
+    train_start_time = time.time()
+
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         current_start_step = start_step_in_epoch if epoch == start_epoch else 0
         train_epoch(epoch, wandb, start_step_in_epoch if epoch == start_epoch else 0, iter_per_epoch)
+    # ====== 🌟 新增：记录训练结束时间并打印总耗时 ======
+    train_end_time = time.time()
+    total_train_time = train_end_time - train_start_time
+    # 格式化为易读形式
+    hours, rem = divmod(total_train_time, 3600)
+    minutes, seconds = divmod(rem, 60)
+    Logger(f"✅ Total training time: {int(hours):02d}h {int(minutes):02d}m {seconds:05.2f}s")
+    Logger(f"✅ Total training time (seconds): {total_train_time:.2f}")
+    if not ddp or (ddp and dist.get_rank() == 0):
+        time_log = {
+            "total_seconds": total_train_time,
+            "formatted": f"{int(hours):02d}h {int(minutes):02d}m {seconds:05.2f}s",
+            "epochs_trained": args.epochs - start_epoch,
+            "total_steps": (args.epochs - start_epoch) * iter_per_epoch,
+        }
+        time_log_path = os.path.join(args.save_dir, "training_time.json")
+        with open(time_log_path, "w") as f:
+            json.dump(time_log, f, indent=2)
+        Logger(f"✅ Training time logged to: {time_log_path}")
+    
+    if wandb is not None and (not ddp or dist.get_rank() == 0):
+        wandb.log({
+            "total_train_time_sec": total_train_time,
+            "total_train_time_formatted": f"{int(hours):02d}h {int(minutes):02d}m {seconds:05.2f}s"
+        })
     # 训练循环结束后
     if not ddp or (ddp and dist.get_rank() == 0):
         timestamp = time.strftime("%Y%m%d-%H%M%S")
