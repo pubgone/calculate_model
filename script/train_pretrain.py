@@ -8,6 +8,7 @@ import argparse
 import time
 import math
 import warnings
+import json
 import torch
 import torch.distributed as dist
 from torch import optim, nn
@@ -42,6 +43,7 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch):
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
 
+
         # ✅ 使用传入的 iter_per_epoch 计算全局 step
         global_step = epoch * iter_per_epoch + step
         total_steps = args.epochs * iter_per_epoch
@@ -49,8 +51,10 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        profiling = (step % args.log_interval == 0) and (not ddp or dist.get_rank() == 0)
+        
         with ctx:
-            res = model(X)
+            res = model(X,  profiling=profiling)
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
@@ -88,6 +92,13 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch):
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
         if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
             model.eval()
+            # 🔥 新增：强制做一次带 profiling 的前向（使用当前 batch）
+            with torch.no_grad(), ctx:
+                res_for_log = model(X, profiling=True)  # 注意：X 是当前 batch
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}-{timestamp}")
+            os.makedirs(ckp_dir, exist_ok=True)
+
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}-{timestamp}")
             os.makedirs(ckp_dir, exist_ok=True)
@@ -106,6 +117,48 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch):
                 'lm_config_dict': lm_config.to_dict() if hasattr(lm_config, 'to_dict') else lm_config.__dict__,
             }
             torch.save(checkpoint, os.path.join(ckp_dir, 'trainer_state.pth'))
+            # === 🌟 新增：保存 profiling 日志 + 耗时摘要 🌟 ===
+            if hasattr(res_for_log, 'profiling_logs') and res_for_log.profiling_logs:
+                log_dir = os.path.join(ckp_dir, "log")
+                os.makedirs(log_dir, exist_ok=True)  # 这行一定会执行！
+        
+                # 保存原始日志
+                with open(os.path.join(log_dir, "profiling_raw.json"), "w") as f:
+                    json.dump(res_for_log.profiling_logs, f, indent=2)
+        
+                # 2. 解析并计算每层模块耗时
+                from collections import defaultdict
+                events_by_layer = defaultdict(dict)
+
+                for event in res_for_log.profiling_logs:
+                    layer = event["layer_id"]
+                    etype = event["event"]
+                    ts = event["timestamp"]
+                    events_by_layer[layer][etype] = ts
+
+                summary = {}
+                summary_txt_lines = ["Layer | Attention Time (ms) | MLP Time (ms)", "-" * 45]
+
+                for layer in sorted(events_by_layer.keys()):
+                    ev = events_by_layer[layer]
+                    attn_time = ev.get("attn_exit", 0) - ev.get("attn_enter", 0)
+                    mlp_time = ev.get("mlp_exit", 0) - ev.get("mlp_enter", 0)
+
+                    summary[f"layer_{layer}"] = {
+                        "attn_time_sec": round(attn_time, 6),
+                        "mlp_time_sec": round(mlp_time, 6)
+                    }
+
+                    summary_txt_lines.append(f"{layer:5} | {attn_time*1000:16.3f} | {mlp_time*1000:13.3f}")
+
+                # 3. 保存结构化 JSON 摘要
+                with open(os.path.join(log_dir, "summary.json"), "w") as f:
+                    json.dump(summary, f, indent=2)
+
+                # 4. 保存人类可读的 TXT 摘要
+                with open(os.path.join(log_dir, "summary.txt"), "w") as f:
+                    f.write("[Profiling Summary]\n")
+                    f.write("\n".join(summary_txt_lines))
 
             Logger(f"Full checkpoint saved to: {ckp_dir}")
             model.train()

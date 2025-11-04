@@ -7,7 +7,6 @@ from transformers import PretrainedConfig
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
-
     def __init__(
             self,
             dropout: float = 0.0,
@@ -86,6 +85,8 @@ import torch
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch import nn
+import time
+from threading import local
 from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
@@ -355,7 +356,23 @@ class MOEFeedForward(nn.Module):
 
         return expert_cache
 
+# 使用线程本地存储，避免多线程/多卡冲突
+_profiling_context = local()
 
+def set_profiling(enabled: bool = False):
+    _profiling_context.enabled = enabled
+
+def is_profiling() -> bool:
+    return getattr(_profiling_context, 'enabled', False)
+
+def log_profiling_event(layer_id: int, event: str, timestamp: float):
+    logs = getattr(_profiling_context, 'logs', None)
+    if logs is not None:
+        logs.append({
+            "layer_id": layer_id,
+            "event": event,
+            "timestamp": timestamp
+        })
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -371,12 +388,28 @@ class MiniMindBlock(nn.Module):
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
+        # === Attention: enter ===
+        if is_profiling():
+            log_profiling_event(self.layer_id, "attn_enter", time.time())
+
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
+
+        # === Attention: exit ===
+        if is_profiling():
+            log_profiling_event(self.layer_id, "attn_exit", time.time())
         hidden_states += residual
+        # === MLP: enter ===
+        if is_profiling():
+            log_profiling_event(self.layer_id, "mlp_enter", time.time())
+
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+
+        # === MLP: exit ===
+        if is_profiling():
+            log_profiling_event(self.layer_id, "mlp_exit", time.time())
         return hidden_states, present_key_value
 
 
@@ -401,7 +434,13 @@ class MiniMindModel(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
+                profiling:bool = False,
                 **kwargs):
+        # 启用 profiling 上下文
+        set_profiling(profiling)
+        if profiling:
+            _profiling_context.logs = []
+
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
@@ -432,8 +471,9 @@ class MiniMindModel(nn.Module):
             for layer in self.layers
             if isinstance(layer.mlp, MOEFeedForward)
         )
-
-        return hidden_states, presents, aux_loss
+        # 返回 profiling logs
+        profiling_logs = getattr(_profiling_context, 'logs', []) if profiling else None
+        return hidden_states, presents, aux_loss, profiling_logs
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -453,12 +493,14 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
+                profiling: bool = False,  # ← 新增参数
                 **args):
-        h, past_kvs, aux_loss = self.model(
+        h, past_kvs, aux_loss, profiling_logs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            profiling=profiling,  # ← 透传
             **args
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -467,4 +509,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('aux_loss', aux_loss)
         self.OUT.__setitem__('past_key_values', past_kvs)
+
+        if profiling:
+            self.OUT.__setitem__('profiling_logs', profiling_logs)
         return self.OUT
