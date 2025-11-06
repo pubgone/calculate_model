@@ -3,7 +3,7 @@ import sys
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 在 import torch 之前设置！
+# os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # 在 import torch 之前设置！
 import argparse
 import time
 import math
@@ -32,7 +32,7 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
-def train_epoch(epoch, wandb,start_step, iter_per_epoch):
+def train_epoch(epoch, wandb,start_step, iter_per_epoch, this_run_start_time, cumulative_train_time):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
 
@@ -105,6 +105,9 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch):
 
             actual_model = model.module if isinstance(model, DistributedDataParallel) else model
             actual_model.save_pretrained(ckp_dir, safe_serialization=False)
+
+            current_this_run_elapsed = time.time() - this_run_start_time
+            current_total_time = cumulative_train_time + current_this_run_elapsed
             # === 新增：保存训练状态 ===
             checkpoint = {
                 'epoch': epoch,
@@ -115,6 +118,7 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch):
                 'lr': optimizer.param_groups[0]['lr'],
                 'args_dict': vars(args),            # 安全！
                 'lm_config_dict': lm_config.to_dict() if hasattr(lm_config, 'to_dict') else lm_config.__dict__,
+                'cumulative_train_time': current_total_time,
             }
             torch.save(checkpoint, os.path.join(ckp_dir, 'trainer_state.pth'))
             # === 🌟 新增：保存 profiling 日志 + 耗时摘要 🌟 ===
@@ -230,8 +234,9 @@ def resume_from_checkpoint(model, optimizer, scaler, checkpoint_path: str, devic
     
     start_epoch = checkpoint['epoch']
     start_step = checkpoint['step']
+    cumulative_train_time = checkpoint.get('cumulative_train_time', 0.0)  # New add
     Logger(f"Resumed training from epoch {start_epoch}, step {start_step}")
-    return start_epoch, start_step
+    return start_epoch, start_step, cumulative_train_time
 
 def init_distributed_mode():
     if not ddp: return
@@ -244,6 +249,24 @@ def init_distributed_mode():
     DEVICE = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(DEVICE)
 
+def validate(model, val_loader, device):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    
+    with torch.no_grad():
+        for X, Y, loss_mask in val_loader:
+            X, Y, loss_mask = X.to(device), Y.to(device), loss_mask.to(device)
+            with ctx:
+                res = model(X)
+                loss = loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
+                loss = (loss * loss_mask).sum()
+                total_loss += loss.item()
+                total_tokens += loss_mask.sum().item()
+    
+    model.train()
+    return total_loss / total_tokens if total_tokens > 0 else float('inf')
 
 # torchrun --nproc_per_node 2 1-pretrain.py
 if __name__ == "__main__":
@@ -258,7 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain")
-    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -271,8 +294,8 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=512, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="corpus/random/addition/1_digit_additions.txt")
-    parser.add_argument("--resume_from", type=str, default=None,
-                    help="Path to a checkpoint directory to resume training from (e.g., ../out/checkpoint-epoch1-step1000)")
+    parser.add_argument("--resume_from", type=str, default=None,help="Path to a checkpoint directory to resume training from (e.g., ../out/checkpoint-epoch1-step1000)")
+    parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation split ratio (e.g., 0.05 for 5%)")
     args = parser.parse_args()
     lm_config = MiniMindConfig(
         hidden_size=256,
@@ -299,21 +322,50 @@ if __name__ == "__main__":
     args.wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
+    ##########################################################################
+    # ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
+    # ddp_local_rank, DEVICE = 0, "cuda:0"
 
-    ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
-    ddp_local_rank, DEVICE = 0, "cuda:0"
-
-    base_seed = 1337
-    torch.manual_seed(base_seed)
-    torch.cuda.manual_seed(base_seed)
+    # base_seed = 1337
+    # torch.manual_seed(base_seed)
+    # torch.cuda.manual_seed(base_seed)
+    # if ddp:
+    #     init_distributed_mode()
+    #     args.device = torch.device(DEVICE)
+    #     rank = dist.get_rank()
+    #     torch.manual_seed(base_seed + rank)
+    #     # 同时设置 CUDA 的随机种子
+    #     torch.cuda.manual_seed(base_seed + rank)
+    #########################################################################
+    # ========== DDP 和设备初始化 ==========
+    ddp = int(os.environ.get("RANK", -1)) != -1  # 检测是否由 torchrun 启动
 
     if ddp:
-        init_distributed_mode()
-        args.device = torch.device(DEVICE)
-        rank = dist.get_rank()
-        torch.manual_seed(base_seed + rank)
-        # 同时设置 CUDA 的随机种子
-        torch.cuda.manual_seed(base_seed + rank)
+        # 初始化分布式后端
+        dist.init_process_group(backend="nccl")
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+
+        # 每个进程绑定到对应的 GPU
+        device = torch.device(f"cuda:{ddp_local_rank}")
+        torch.cuda.set_device(device)
+
+        # 同步随机种子（确保每个 rank 数据打乱不同但可复现）
+        base_seed = 1337
+        torch.manual_seed(base_seed + ddp_rank)
+        torch.cuda.manual_seed(base_seed + ddp_rank)
+    else:
+        # 非 DDP 模式
+        ddp_rank = 0
+        ddp_local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(1337)
+        torch.cuda.manual_seed(1337)
+
+    # 统一设置 args.device 供后续使用
+    args.device = device
+
 
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import swanlab as wandb
@@ -326,16 +378,49 @@ if __name__ == "__main__":
     if not ddp or dist.get_rank() == 0:
         tokenizer_save_path = os.path.join(args.save_dir, "tokenizer")
         tokenizer.save_pretrained(tokenizer_save_path)
-    Logger(f"Tokenizer has been saved to: {tokenizer_save_path}")
-    # # 🔍 === 验证代码放在这里 ===
-    # if not ddp or dist.get_rank() == 0:  # 只在主进程打印，避免多卡重复输出
-    #     print("✅ Tokenizer vocab size:", tokenizer.vocab_size)
-    #     print("✅ Model vocab size:", model.config.vocab_size)
-    #     test_output = tokenizer("12+34=46", add_special_tokens=True, return_tensors="pt")
-    #     test_encode = tokenizer("12+34=46", add_special_tokens=True).input_ids
-    #     print("✅ Test encode shape:", test_encode.shape)        # torch.Size([1, L])
-    #     print("✅ Test encode IDs:", test_encode.tolist())       # 转为 list 打印
-    #     print("✅ Decoded back:", tokenizer.decode(test_encode[0], skip_special_tokens=False))
+        Logger(f"Tokenizer has been saved to: {tokenizer_save_path}")
+
+    # ====== 🌟 新增：划分训练集和验证集 ======
+    full_dataset = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    total_size = len(full_dataset)
+    val_size = int(total_size * args.val_ratio)
+    train_size = total_size - val_size
+
+    # 固定随机种子确保可复现
+    generator = torch.Generator().manual_seed(42)
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size], generator=generator
+    )
+
+    Logger(f"Dataset split: {train_size} train, {val_size} val")
+
+    # ====== 🌟 新增：保存数据集划分信息 ======
+    if not ddp or (ddp and dist.get_rank() == 0):
+        dataset_dir = os.path.join(args.save_dir, "dataset")
+        os.makedirs(dataset_dir, exist_ok=True)
+
+        # 保存划分索引（最轻量）
+        split_info = {
+            "train_indices": train_ds.indices,
+            "val_indices": val_ds.indices,
+            "val_ratio": args.val_ratio,
+            "total_size": total_size,
+            "data_path": args.data_path,
+            "seed": 42
+        }
+        with open(os.path.join(dataset_dir, "split_info.json"), "w") as f:
+            json.dump(split_info, f, indent=2)
+
+        # （可选）保存实际样本预览（用于人工检查）
+        preview = {
+            "train_samples": [tokenizer.decode(full_dataset[i][0], skip_special_tokens=False) for i in train_ds.indices[:5]],
+            "val_samples": [tokenizer.decode(full_dataset[i][0], skip_special_tokens=False) for i in val_ds.indices[:5]]
+        }
+        with open(os.path.join(dataset_dir, "samples_preview.json"), "w") as f:
+            json.dump(preview, f, indent=2, ensure_ascii=False)
+
+        Logger(f"Dataset split info saved to: {dataset_dir}")
+
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     
     train_sampler = DistributedSampler(train_ds) if ddp else None
@@ -348,35 +433,63 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         sampler=train_sampler
     )
+    # ====== 🌟 新增：验证集 DataLoader ======
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        pin_memory=True,
+        drop_last=False,
+        shuffle=False,
+        num_workers=args.num_workers
+    )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     # ========== 在 DDP 之前恢复 checkpoint ==========
     actual_model = model  # 保存原始模型引用
     start_epoch, start_step_in_epoch = 0, 0
+    cumulative_train_time = 0.0  # ✅ 初始化累计时间
+
     resume_checkpoint = args.resume_from or find_latest_checkpoint(args.save_dir)
     if resume_checkpoint:
         try:
-            start_epoch, start_step_in_epoch = resume_from_checkpoint(
+            start_epoch, start_step_in_epoch, cumulative_train_time = resume_from_checkpoint(
                 actual_model, optimizer, scaler, resume_checkpoint, args.device
             )
         except Exception as e:
             Logger(f"Resume failed: {e}. Starting from scratch.")
+            cumulative_train_time = 0.0  # 出错则归零
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
     # ====== 🌟 新增：记录训练开始时间 ======
-    train_start_time = time.time()
+    this_run_start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         current_start_step = start_step_in_epoch if epoch == start_epoch else 0
-        train_epoch(epoch, wandb, start_step_in_epoch if epoch == start_epoch else 0, iter_per_epoch)
+        current_start_step = start_step_in_epoch if epoch == start_epoch else 0
+        train_epoch(
+            epoch, 
+            wandb, 
+            current_start_step, 
+            iter_per_epoch, 
+            this_run_start_time, 
+            cumulative_train_time
+        )
+        # ====== 🌟 新增：每 epoch 验证 ======
+        if not ddp or dist.get_rank() == 0:
+            val_loss = validate(model, val_loader, args.device)
+            Logger(f"Epoch {epoch+1} Validation Loss: {val_loss:.6f}")
+            if wandb is not None:
+                wandb.log({"val_loss": val_loss, "epoch": epoch+1})  
+
     # ====== 🌟 新增：记录训练结束时间并打印总耗时 ======
-    train_end_time = time.time()
-    total_train_time = train_end_time - train_start_time
+    this_run_end_time = time.time()
+    this_run_duration = this_run_end_time - this_run_start_time
+    total_train_time = cumulative_train_time + this_run_duration
     # 格式化为易读形式
     hours, rem = divmod(total_train_time, 3600)
     minutes, seconds = divmod(rem, 60)
