@@ -3,7 +3,6 @@ import sys
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-# os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # 在 import torch 之前设置！
 import argparse
 import time
 import math
@@ -17,8 +16,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
 from typing import Optional
 from my_tokenizers.hf_math_tokenizer import HFMathTokenizer
-from models.model_minimind import MiniMindConfig, MiniMindForCausalLM
-from model_ultils.pretrain_dataset import PretrainDataset
+from models.model_minimind import MiniMindConfig, MiniMindForCausalLM, MiniMindForRegression
+from model_ultils.pretrain_dataset import PretrainDataset, MSEPretrainDataset
 
 warnings.filterwarnings('ignore')
 
@@ -36,12 +35,21 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch, this_run_start_time, cu
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
 
-    for step, (X, Y, loss_mask) in enumerate(train_loader):
+    for step, batch in enumerate(train_loader):
         if step < start_step:
             continue  # 跳过已训练的 steps
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+        # 🔹 动态解包 batch（causal: (X,Y,mask); mse: (input_ids, targets)）
+        if args.loss_type == "causal":
+            X, Y, loss_mask = batch
+            X = X.to(args.device)
+            Y = Y.to(args.device)
+            loss_mask = loss_mask.to(args.device)
+            profiling_input = X
+        else:  # "mse"
+            input_ids, targets = batch
+            input_ids = input_ids.to(args.device)      # [B, L]
+            targets = targets.to(args.device).squeeze(-1)  # [B, 1] → [B]
+            profiling_input = input_ids  # ✅ MSE 用 input_ids 做 profiling
 
 
         # ✅ 使用传入的 iter_per_epoch 计算全局 step
@@ -53,16 +61,38 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch, this_run_start_time, cu
 
         profiling = (step % args.log_interval == 0) and (not ddp or dist.get_rank() == 0)
         
+        # 🔹 前向 + 损失计算（分模式）
         with ctx:
-            res = model(X,  profiling=profiling)
-            loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
-                Y.view(-1)
-            ).view(Y.size())
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
-            loss = loss / args.accumulation_steps
+            if args.loss_type == "causal":
+                # ✅ 确保 model 是 MiniMindForCausalLM → 接受 input_ids, 返回 .logits
+                res = model(input_ids=X, profiling=profiling)  # ← 明确 keyword
+                loss_fct = nn.CrossEntropyLoss(reduction='none')
+                loss = loss_fct(
+                    res.logits.view(-1, res.logits.size(-1)),
+                    Y.view(-1)
+                ).view(Y.size())
+                loss = (loss * loss_mask).sum() / loss_mask.sum()
+                if hasattr(res, 'aux_loss') and res.aux_loss is not None:
+                    loss = loss + res.aux_loss
 
+            else:  # "mse"
+                # ✅ 确保 model 是 MiniMindForRegression → 接受 input_ids + labels
+                # 注意：MSEPretrainDataset 返回 targets.shape = [B, 1] → 需 squeeze to [B]
+                # print(f"[DEBUG RANK{dist.get_rank()}] targets shape: {targets.shape}, dtype: {targets.dtype}, device: {targets.device}")
+                # print(f"[DEBUG] targets[:3]: {targets[:3]}")
+                targets_squeezed = targets.squeeze(-1)  # [B, 1] → [B]
+                # print(f"[DEBUG] targets_squeezed shape: {targets_squeezed.shape}")
+                res = model(
+                    input_ids=input_ids,
+                    labels=targets_squeezed,  # ← 必须是 [B]
+                    profiling=profiling
+                )
+                # print(f"[DEBUG] res.loss = {res.loss}, type={type(res.loss)}")
+                loss = res.loss  # ← RegressionOutput.loss
+                # 若启用 MOE，res 中可能有 aux_loss → 已在 MiniMindForRegression 中加过了
+
+            loss = loss / args.accumulation_steps
+            
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
@@ -90,11 +120,31 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch, this_run_start_time, cu
                 wandb.log({"loss": loss.item() * args.accumulation_steps,
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
+            # === 📝 新增：本地持久化 train loss 日志（CSV格式）===
+            if not ddp or dist.get_rank() == 0:
+                global_step = epoch * iter_per_epoch + step
+                loss_val = loss.item() * args.accumulation_steps
+                lr_val = optimizer.param_groups[-1]['lr']
+                
+                loss_log_path = os.path.join(args.save_dir, "train_loss.csv")
+                header_needed = not os.path.exists(loss_log_path)
+                with open(loss_log_path, "a") as f_loss:
+                    if header_needed:
+                        f_loss.write("global_step,epoch,step,loss,lr\n")
+                    f_loss.write(f"{global_step},{epoch + 1},{step},{loss_val:.8f},{lr_val:.10f}\n")
+            # === 📝 新增结束 ===
         if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
             model.eval()
+
+            # 🔥 动态构造 profiling 输入
+            if args.loss_type == "causal":
+                profiling_input = X
+            else:  # mse
+                profiling_input = input_ids
+
             # 🔥 新增：强制做一次带 profiling 的前向（使用当前 batch）
             with torch.no_grad(), ctx:
-                res_for_log = model(X, profiling=True)  # 注意：X 是当前 batch
+                res_for_log = model(profiling_input, profiling=True)  # 注意：X 是当前 batch
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}-{timestamp}")
             os.makedirs(ckp_dir, exist_ok=True)
@@ -166,43 +216,23 @@ def train_epoch(epoch, wandb,start_step, iter_per_epoch, this_run_start_time, cu
 
             Logger(f"Full checkpoint saved to: {ckp_dir}")
             model.train()
-        # if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
-        #     model.eval()
-        #     ckp_dir = os.path.join(args.save_dir, f"checkpoint-epoch{epoch+1}-step{step+1}")
-        #     os.makedirs(ckp_dir, exist_ok=True)
 
-        #     actual_model = model.module if isinstance(model, DistributedDataParallel) else model
-
-        #     # 只保存模型（config + weights）
-        #     actual_model.save_pretrained(ckp_dir, safe_serialization=False)
-        #     # 不再保存 tokenizer！
-
-        #     Logger(f"Model checkpoint has been saved to: {ckp_dir}")
-        #     model.train()    
-
-        # if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
-        #     model.eval()
-        #     moe_path = '_moe' if lm_config.use_moe else ''
-        #     ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
-
-        #     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        #         state_dict = model.module.state_dict()
-        #     else:
-        #         state_dict = model.state_dict()
-
-        #     state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
-        #     torch.save(state_dict, ckp)
-        #     model.train()
-
-
-def init_model(lm_config, resume_path=None):
+def init_model(lm_config,loss_type="causal", resume_path=None):
     tokenizer = HFMathTokenizer()
     lm_config.vocab_size = tokenizer.vocab_size  # ← 新增这一行
+
+    if loss_type == "causal":
+        ModelClass = MiniMindForCausalLM
+    elif loss_type == "mse":
+        ModelClass = MiniMindForRegression
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+    
     if resume_path is not None and os.path.exists(resume_path):
         Logger(f"Loading model from checkpoint: {resume_path}")
-        model = MiniMindForCausalLM.from_pretrained(resume_path, config=lm_config)
+        model = ModelClass.from_pretrained(resume_path, config=lm_config)
     else:
-        model = MiniMindForCausalLM(lm_config)
+        model = ModelClass(lm_config)
 
     model = model.to(args.device)
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
@@ -249,25 +279,44 @@ def init_distributed_mode():
     DEVICE = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(DEVICE)
 
-def validate(model, val_loader, device):
+def validate(model, val_loader, device, loss_type="causal"):
     model.eval()
     total_loss = 0.0
-    total_tokens = 0
-    loss_fct = nn.CrossEntropyLoss(reduction='none')
-    
-    with torch.no_grad():
-        for X, Y, loss_mask in val_loader:
-            X, Y, loss_mask = X.to(device), Y.to(device), loss_mask.to(device)
-            with ctx:
-                res = model(X)
-                loss = loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
-                loss = (loss * loss_mask).sum()
-                total_loss += loss.item()
-                total_tokens += loss_mask.sum().item()
-    
-    model.train()
-    return total_loss / total_tokens if total_tokens > 0 else float('inf')
+    total_items = 0
 
+    with torch.no_grad():
+        for batch in val_loader:
+            n_items = 0  # 🔥 关键：提前初始化 n_items，防 UnboundLocalError
+            loss_val = 0.0
+
+            try:
+                if loss_type == "causal":
+                    X, Y, loss_mask = batch
+                    X, Y, loss_mask = X.to(device), Y.to(device), loss_mask.to(device)
+                    res = model(input_ids=X)
+                    loss_fct = nn.CrossEntropyLoss(reduction='none')
+                    loss = loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
+                    loss_val = (loss * loss_mask).sum().item()
+                    n_items = loss_mask.sum().item()
+
+                else:  # "mse"
+                    input_ids, targets = batch
+                    input_ids = input_ids.to(device)
+                    targets = targets.to(device).squeeze(-1)
+                    res = model(input_ids=input_ids, labels=targets)
+                    # res.loss 是 batch-mean，还原为 sum
+                    loss_val = (res.loss * targets.size(0)).item()
+                    n_items = targets.size(0)
+
+                total_loss += loss_val
+                total_items += n_items
+
+            except Exception as e:
+                print(f"[Validate] Skip one batch due to error: {e}")
+                continue  # 跳过坏 batch，不中断验证
+
+    model.train()
+    return total_loss / total_items if total_items > 0 else float('inf')
 # torchrun --nproc_per_node 2 1-pretrain.py
 if __name__ == "__main__":
 
@@ -296,6 +345,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="corpus/random/addition/1_digit_additions.txt")
     parser.add_argument("--resume_from", type=str, default=None,help="Path to a checkpoint directory to resume training from (e.g., ../out/checkpoint-epoch1-step1000)")
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation split ratio (e.g., 0.05 for 5%)")
+    parser.add_argument("--loss_type", type=str, default="causal", choices=["causal", "mse"],help="Loss type: 'causal' for language modeling (CE), 'mse' for regression")
     args = parser.parse_args()
     lm_config = MiniMindConfig(
         hidden_size=256,
@@ -307,13 +357,8 @@ if __name__ == "__main__":
         dropout=0.1,
         flash_attn=True
     )
-    # lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-    #                            use_moe=args.use_moe)
+
     args.save_dir = os.path.join(args.out_dir)
-    # model, tokenizer = init_model(lm_config)
-    # print("✅ Tokenizer vocab size:", tokenizer.vocab_size)
-    # print("✅ Model vocab size:", model.config.vocab_size)
-    # print("✅ Test encode:", tokenizer("12+34=46", add_special_tokens=True).input_ids)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
     tokens_per_iter = args.batch_size * args.max_seq_len
@@ -322,21 +367,7 @@ if __name__ == "__main__":
     args.wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
-    ##########################################################################
-    # ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
-    # ddp_local_rank, DEVICE = 0, "cuda:0"
 
-    # base_seed = 1337
-    # torch.manual_seed(base_seed)
-    # torch.cuda.manual_seed(base_seed)
-    # if ddp:
-    #     init_distributed_mode()
-    #     args.device = torch.device(DEVICE)
-    #     rank = dist.get_rank()
-    #     torch.manual_seed(base_seed + rank)
-    #     # 同时设置 CUDA 的随机种子
-    #     torch.cuda.manual_seed(base_seed + rank)
-    #########################################################################
     # ========== DDP 和设备初始化 ==========
     ddp = int(os.environ.get("RANK", -1)) != -1  # 检测是否由 torchrun 启动
 
@@ -374,14 +405,21 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer = init_model(lm_config, resume_path=args.resume_from)
+    model, tokenizer = init_model(lm_config, resume_path=args.resume_from, loss_type=args.loss_type)
     if not ddp or dist.get_rank() == 0:
         tokenizer_save_path = os.path.join(args.save_dir, "tokenizer")
         tokenizer.save_pretrained(tokenizer_save_path)
         Logger(f"Tokenizer has been saved to: {tokenizer_save_path}")
 
     # ====== 🌟 新增：划分训练集和验证集 ======
-    full_dataset = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    if args.loss_type == "causal":
+        DatasetClass = PretrainDataset
+    elif args.loss_type == "mse":
+        DatasetClass = MSEPretrainDataset
+    else:
+        raise ValueError(f"Unknown loss_type: {args.loss_type}")
+
+    full_dataset = DatasetClass(args.data_path, tokenizer, max_length=args.max_seq_len)
     total_size = len(full_dataset)
     val_size = int(total_size * args.val_ratio)
     train_size = total_size - val_size
@@ -421,8 +459,14 @@ if __name__ == "__main__":
 
         Logger(f"Dataset split info saved to: {dataset_dir}")
 
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    
+    if args.loss_type == "causal":
+        DatasetClass = PretrainDataset
+    elif args.loss_type == "mse":
+        DatasetClass = MSEPretrainDataset
+    else:
+        raise ValueError(f"Unknown loss_type: {args.loss_type}")
+    full_dataset = DatasetClass(args.data_path, tokenizer, max_length=args.max_seq_len)
+    Logger(f"✅ Loaded {args.loss_type} dataset with {len(full_dataset)} samples")
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(
         train_ds,
@@ -481,10 +525,19 @@ if __name__ == "__main__":
         )
         # ====== 🌟 新增：每 epoch 验证 ======
         if not ddp or dist.get_rank() == 0:
-            val_loss = validate(model, val_loader, args.device)
+            val_loss = validate(model, val_loader, args.device, args.loss_type)
             Logger(f"Epoch {epoch+1} Validation Loss: {val_loss:.6f}")
             if wandb is not None:
                 wandb.log({"val_loss": val_loss, "epoch": epoch+1})  
+
+            # === 📝 新增：本地持久化 val loss 日志（CSV格式）===
+            val_loss_log_path = os.path.join(args.save_dir, "val_loss.csv")
+            header_needed = not os.path.exists(val_loss_log_path)
+            with open(val_loss_log_path, "a") as f_val:
+                if header_needed:
+                    f_val.write("epoch,val_loss\n")
+                f_val.write(f"{epoch + 1},{val_loss:.8f}\n")
+            # === 📝 新增结束 ===
 
     # ====== 🌟 新增：记录训练结束时间并打印总耗时 ======
     this_run_end_time = time.time()
@@ -528,20 +581,3 @@ if __name__ == "__main__":
         tokenizer.save_pretrained(final_model_path)
 
         Logger(f"The final model has been saved to: {final_model_path}")
-    # if not ddp or (ddp and dist.get_rank() == 0):
-    #     # 构建最终模型名称
-    #     model_name = f"minimind-math-h{args.hidden_size}-l{args.num_hidden_layers}"
-    #     if args.use_moe:
-    #         model_name += "-moe"
-
-    #     final_model_path = os.path.join(args.save_dir, model_name)
-    #     os.makedirs(final_model_path, exist_ok=True)
-
-    #     actual_model = model.module if isinstance(model, DistributedDataParallel) else model
-
-    #     # 保存完整模型（权重 + config）
-    #     actual_model.save_pretrained(final_model_path, safe_serialization=False)
-    #     # 保存 tokenizer（这次要包含！）
-    #     tokenizer.save_pretrained(final_model_path)
-
-    #     Logger(f"The final model has been saved to: {final_model_path}")

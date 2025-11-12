@@ -2,7 +2,7 @@ import os
 import torch
 
 # ✅ 正确导入方式（同级目录）
-from hf_math_tokenizer import HFMathTokenizer
+from my_tokenizers.hf_math_tokenizer import HFMathTokenizer
 
 print("✅ 正在创建 HFMathTokenizer...")
 

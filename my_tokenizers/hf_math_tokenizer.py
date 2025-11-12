@@ -20,7 +20,7 @@ class HFMathTokenizer(PreTrainedTokenizer):
     ):
         # 默认特殊 token
         if special_tokens is None:
-            special_tokens = ["<pad>", "<unk>", "<s>", "</s>"]
+            special_tokens = ["<pad>", "<unk>", "<s>", "</s>","<compute>","</compute>"]
         if operators is None:
             operators = ["+", "-", "*", "/", "^", "=", "(", ")", ".", ",", " "]
         if functions is None:
@@ -50,6 +50,8 @@ class HFMathTokenizer(PreTrainedTokenizer):
         eos_token = kwargs.pop("eos_token", "</s>")
         unk_token = kwargs.pop("unk_token", "<unk>")
         pad_token = kwargs.pop("pad_token", "<pad>")
+        bos_task_token = kwargs.pop("bos_task_token", "<compute>")
+        eos_task_token = kwargs.pop("eos_task_token", "</compute>")
         # # 特殊 token
         # pad_token = "<pad>"
         # unk_token = "<unk>"
@@ -62,6 +64,8 @@ class HFMathTokenizer(PreTrainedTokenizer):
             unk_token=unk_token,
             bos_token=bos_token,
             eos_token=eos_token,
+            bos_task_token=bos_task_token,
+            eos_task_token=eos_task_token,
             **kwargs
         )
 
