@@ -540,29 +540,31 @@ class RegressionOutput(ModelOutput):
     last_token_hidden: Optional[torch.FloatTensor] = None  # [B, H]
     profiling_logs: Optional[List[dict]] = None
 
-class MiniMindForRegression(PreTrainedModel, GenerationMixin):
+class MiniMindForRegression(PreTrainedModel):
     config_class = MiniMindConfig
+    _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
 
     def __init__(self, config: MiniMindConfig = None):
         super().__init__(config or MiniMindConfig())
         self.config = config or MiniMindConfig()
 
-        # 🔹 复用原有主干（关键！不重复定义）
+        # 🔹 复用主干（与 CausalLM 共享）
         self.model = MiniMindModel(self.config)
 
-        # 🔹 新增：回归头 —— MLP 结构（推荐）
+        # 🔹 回归头（MLP）
         self.regressor = nn.Sequential(
             nn.Linear(self.config.hidden_size, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(256, 1)
-            # 注意：无输出激活 → 允许任意实数
         )
 
-        # 🔹 初始化回归头
-        self._init_weights()
+        # 🔹 初始化 regressor（标准 HF 方式）
+        self.post_init()  # ← 替代 _init_weights，安全可靠
 
-    def _init_weights(self):
+    def post_init(self):
+        """Initialize regressor weights after __init__"""
+        super().post_init()
         for module in self.regressor.modules():
             if isinstance(module, nn.Linear):
                 module.weight.data.normal_(mean=0.0, std=self.config.hidden_size ** -0.5)
@@ -571,57 +573,43 @@ class MiniMindForRegression(PreTrainedModel, GenerationMixin):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,      # [B]
+        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        profiling: bool = False,                    # ← 新增：是否开启 profiling
+        labels: Optional[torch.Tensor] = None,      # [B]
+        profiling: bool = False,
         **kwargs
-    ):
-        """
-        Args:
-            input_ids: [B, L]
-            attention_mask: [B, L] (optional)
-            labels: [B] —— 标量目标值（如 11.0, -2.5）
-            profiling: bool —— 是否收集 profiling logs（同 MiniMindForCausalLM）
-        Returns:
-            loss: Optional[torch.Tensor]
-            prediction: [B]
-            last_hidden_state: [B, L, H]
-            last_token_hidden: [B, H]
-            profiling_logs: Optional[List[dict]] —— 仅当 profiling=True 时存在
-        """
-        # 🔹 1. 主干前向（透传 profiling 参数）
-        hidden_states, past_kvs, aux_loss, profiling_logs = self.model(
+    ) -> RegressionOutput:
+        # 🔹 主干前向
+        hidden_states, _, aux_loss, profiling_logs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            profiling=profiling,  # ← 🔥 透传！关键
+            profiling=profiling,
             **kwargs
-        )  # hidden_states: [B, L, H]
+        )
 
-        # 🔹 2. Pooling: 取最后一个非 pad token 的 hidden（即 <eos> 位置）
+        # 🔹 Pooling: 取最后一个非 pad token 的 hidden
         if attention_mask is None:
-            pad_id = getattr(self.config, 'pad_token_id', 0)
+            pad_id = getattr(self.config, "pad_token_id", 0)
             mask = (input_ids != pad_id)
         else:
             mask = attention_mask.bool()
-
-        valid_lengths = mask.sum(dim=1).clamp(min=1)  # 至少为 1，防全 pad
-        last_idx = valid_lengths - 1                 # [B]
-        last_idx = last_idx.long()                    # 确保是 LongTensor（索引用）
+        valid_lengths = mask.sum(dim=1).clamp(min=1)
+        last_idx = valid_lengths - 1
         batch_indices = torch.arange(input_ids.size(0), device=input_ids.device)
-        last_hidden = hidden_states[batch_indices, last_idx]  # [B, H]
+        last_hidden = hidden_states[batch_indices, last_idx]
 
-        # 🔹 3. 回归头预测
-        prediction = self.regressor(last_hidden).squeeze(-1)  # [B]
+        # 🔹 预测
+        prediction = self.regressor(last_hidden).squeeze(-1)
 
-        # 🔹 4. 计算损失（若提供 labels）
+        # 🔹 损失（仅训练时）
         loss = None
         if labels is not None:
+            if labels.dim() > 1:
+                labels = labels.squeeze(-1)
             loss = torch.nn.functional.mse_loss(prediction, labels)
             if self.config.use_moe and aux_loss is not None:
                 loss = loss + aux_loss
 
-        # 🔹 5. 返回标准 HF Output
         return RegressionOutput(
             loss=loss,
             prediction=prediction,
@@ -629,7 +617,3 @@ class MiniMindForRegression(PreTrainedModel, GenerationMixin):
             last_token_hidden=last_hidden,
             profiling_logs=profiling_logs if profiling and profiling_logs is not None else None
         )
-
-    # def prepare_inputs_for_generation(self, *args, **kwargs):
-    #     """Stub for compatibility with `generate()` (not used in regression)."""
-    #     raise NotImplementedError("Regression model does not support generation.")
