@@ -18,7 +18,7 @@ from contextlib import nullcontext
 from typing import Optional
 from my_tokenizers.hf_math_tokenizer import HFMathTokenizer
 from models.model_minimind import MiniMindConfig, MiniMindForCausalLM, MiniMindForRegression
-from model_ultils.pretrain_dataset import PretrainDataset, MSEPretrainDataset
+from model_utils.pretrain_dataset import PretrainDataset, MSEPretrainDataset
 
 warnings.filterwarnings('ignore')
 
